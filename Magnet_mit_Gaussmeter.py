@@ -1,3 +1,13 @@
+# Delta SM 60-100 Magnet Controller and Calculator
+# - PyQt5 GUI to operate a Delta SM 60-100 power supply (TCP) and read a Gaussmeter (via EX-6030 TCP)
+# - Three main workflows:
+#   1) Calculate required magnetic field/current from ion-beam parameters and apply the result.
+#   2) Manual control with a high-precision, step-selectable slider and direct input.
+#   3) Automated current switching based on data-file counts, plus an optional mass scan.
+# - Continuous measurement loop (1 Hz) shows live current/voltage (supply) and magnetic field (Gaussmeter).
+# - Optional txt logging writes timestamped current/voltage/field with a header.
+# - Defensive connectivity: per-device sockets, lazy reconnect for Gaussmeter, status labels; clean shutdown.
+
 import socket
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -8,7 +18,9 @@ import os
 import glob
 import time
 
+
 class ScrollableSlider(QtWidgets.QSlider):
+    # Slider with mouse-wheel stepping. Uses a caller-provided step_func() to compute tick step size.
     def __init__(self, parent=None, step_func=None):
         super().__init__(Qt.Horizontal, parent)
         self.step_func = step_func
@@ -22,53 +34,55 @@ class ScrollableSlider(QtWidgets.QSlider):
             self.setValue(max(self.minimum(), self.value() - step))
         event.accept()
 
+
 class DeltaMagnetController(QtWidgets.QMainWindow):
+    # Main window: builds UI, manages two TCP devices (magnet & Gaussmeter), and coordinates modes & timers.
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Delta SM 60-100 Magnet Controller and Calculator")
-        self.setFixedSize(900, 950)  # Increased size for new controls
+        self.setFixedSize(900, 950)  # Room for all control groups
         
-        # TCP Configuration (Magnet)
+        # --- TCP: Delta Magnet (set/read current/voltage) ---
         self.HOST = "192.168.0.5"
         self.PORT = 8462
         self.sock = None
 
-        # TCP Configuration (Gaussmeter über EX-6030)
-        self.GM_HOST = "192.168.0.13"   # <<--- anpassen, falls nötig
+        # --- TCP: Gaussmeter via EX-6030 (ASCII protocol, line-oriented) ---
+        self.GM_HOST = "192.168.0.13"   
         self.GM_PORT = 100
         self.gm_sock = None
-        self._gm_write_delay = 0.06     # ~50–80 ms
-        self._gm_read_idle = 0.25       # pro recv()-Wartezeit
-        self._gm_read_overall = 0.8     # Gesamtlese-Timeout kurz halten
+        self._gm_write_delay = 0.06     # inter-command delay
+        self._gm_read_idle = 0.25       # per recv wait
+        self._gm_read_overall = 0.8     # overall read timeout
         self.last_field_kG = float("nan")
 
-        # Initialize calculation variables
-        self.mass = 1.0  # u
+        # --- Calculation inputs/outputs (beam params -> B field -> current) ---
+        self.mass = 1.0                 # u
         self.extraction_voltage = 1000.0  # V
-        self.sputter_voltage = 1000.0  # V
+        self.sputter_voltage = 1000.0     # V
         
-        # Current Switching State
+        # --- Auto/Manual switching state (file-count driven rotation of currents) ---
         self.current_mode = "Manual"  # Manual | Auto
-        self.current_values = [0.0, 0.0, 0.0]  # [Current1, Current2, Current3]
-        self.data_counts = [10, 10, 10]  # Data counts [Count1, Count2, Count3]
+        self.current_values = [0.0, 0.0, 0.0]   # three candidate currents (A)
+        self.data_counts = [10, 10, 10]        # required file increments for each step
         self.switch_timer = QtCore.QTimer()
         self.active_current_index = 0
         self.last_switch_time = datetime.now()
         self.last_data_count = 0
         self.data_counter = 0
-        self.data_path = r"\\192.168.0.1\current analysis\*.blk"
+        self.data_path = r"\\192.168.0.1\current analysis\*.blk"  # remote measurement files
         
-        # Slider control variables
-        self.multiplier = 1000  # For 3 decimal places precision
-        self.current_step = 100  # Default step size (0.1 A)
-        self.allowed_steps = [0.001, 0.01, 0.1, 1.0, 10.0]  # Allowed step sizes in A
+        # --- Slider scaling & step model (A <-> ticks) ---
+        self.multiplier = 1000           # ticks per amp (0.001 A resolution)
+        self.current_step = 100          # default wheel/arrow delta in ticks (0.1 A)
+        self.allowed_steps = [0.001, 0.01, 0.1, 1.0, 10.0]  # per-row step choices (A)
         
-        # Logging State
+        # --- Logging state (CSV append with header) ---
         self.logging_active = False
         self.log_file = None
         self.log_start_time = None
         
-        # Mass Scan State
+        # --- Mass scan state (linear ramp by increment, independent of Auto mode) ---
         self.scan_active = False
         self.scan_timer = QtCore.QTimer()
         self.scan_current = 0.0
@@ -76,14 +90,15 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.scan_stop = 0.0
         self.scan_increment = 0.1
         
-        # UI Setup
+        # Build UI and connect devices
         self.create_ui()
-        self.connect_device()
-        self.connect_gaussmeter()  # <<-- Gaussmeter TCP verbinden
+        self.connect_device()       # magnet TCP
+        self.connect_gaussmeter()   # Gaussmeter TCP
     
-    # ---------------- Gaussmeter-Helfer ----------------
+    # ---------------- Gaussmeter helpers (ASCII command/response) ----------------
     def connect_gaussmeter(self):
         """Stellt TCP-Verbindung zum EX-6030 her und setzt das 421 (unverbindlich) auf Gauss/DC/Autorange."""
+        # Connect and do a minimal setup; errors are non-fatal (we retry on next tick).
         try:
             if self.gm_sock:
                 try:
@@ -93,14 +108,14 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
                 self.gm_sock = None
             s = socket.create_connection((self.GM_HOST, self.GM_PORT), timeout=2)
             s.settimeout(1.0)
-            # kleine Grundkonfiguration; Antwort wird verworfen
-            for cmd in (b"UNIT G", b"ACDC 0", b"AUTO 1"):
+            # Basic configuration; discard responses (we only verify round-trip).
+            for cmd in (b"UNIT G", b"ACDC 0", b"AUTO 1"):  # Gauss, DC, autorange
                 s.sendall(cmd + b"\r\n")
                 time.sleep(self._gm_write_delay)
-                self._gm_read_line(s)  # lese ggf. eine Zeile
+                self._gm_read_line(s)
             self.gm_sock = s
         except Exception:
-            self.gm_sock = None  # wir versuchen beim nächsten Tick erneut
+            self.gm_sock = None  # reconnect attempt will happen in update_measurements()
 
     def _gm_read_line(self, sock):
         """Liest bis CR oder LF oder Timeout (ASCII)."""
@@ -139,6 +154,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
 
     def _gm_read_field_kG(self):
         """Liest das Feld und gibt es als kG (float) zurück. Rechnet korrekt, egal ob das 421 gerade T oder G sendet."""
+        # Query value, multiplier, and unit; normalize to Gauss, then return kG.
         if not self.gm_sock:
             return float("nan")
         mult_map = {"µ": 1e-6, "u": 1e-6, "m": 1e-3, "": 1.0, "k": 1e3}
@@ -150,22 +166,22 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         except Exception:
             return float("nan")
         value = base * mult_map.get((mul or "").strip(), 1.0)
-        # jetzt in Gauss bringen
+        # Convert Tesla -> Gauss if needed (1 T = 10,000 G).
         if (unit or "").strip().upper().startswith("T"):
-            value *= 1e4  # 1 T = 10,000 G
-        # value ist in G -> nach kG
+            value *= 1e4
+        # Return in kG.
         return value / 1000.0
 
-    # ---------------- UI ----------------
+    # ---------------- UI composition ----------------
     def create_ui(self):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout()
 
-        # ====== Calculation Panel ======
+        # ===== Calculation Panel (beam params -> B field & required current) =====
         calc_group = QtWidgets.QGroupBox("Ion Beam Parameters")
         calc_layout = QtWidgets.QGridLayout()
         
-        # Input Fields
+        # Inputs: mass, extraction, sputter (independent of any live device readings)
         self.mass_input = QtWidgets.QDoubleSpinBox()
         self.mass_input.setRange(1, 500)
         self.mass_input.setValue(1.0)
@@ -184,18 +200,18 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.sputter_input.setSuffix(" V")
         self.sputter_input.valueChanged.connect(self.update_calculations)
         
-        # Result Indicators
+        # Outputs: calculated B (kG) and corresponding current (A)
         self.b_field_indicator = QtWidgets.QLabel("0.00 kG")
         self.b_field_indicator.setStyleSheet("font-weight: bold; color: #2E86C1;")
         
         self.calc_current_indicator = QtWidgets.QLabel("0.00 A")
         self.calc_current_indicator.setStyleSheet("font-weight: bold; color: #27AE60;")
         
-        # Set button
+        # Apply button: copies the computed current into the manual slider
         self.set_calc_btn = QtWidgets.QPushButton("Set")
         self.set_calc_btn.clicked.connect(self.set_calculated_current)
         
-        # Layout
+        # Layout wiring
         calc_layout.addWidget(QtWidgets.QLabel("Mass:"), 0, 0)
         calc_layout.addWidget(self.mass_input, 0, 1)
         calc_layout.addWidget(QtWidgets.QLabel("Extraction Voltage:"), 1, 0)
@@ -209,18 +225,19 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         calc_layout.addWidget(self.set_calc_btn, 2, 2, 1, 2)
         calc_group.setLayout(calc_layout)
         
-        # Connection Status
+        # Connection status banner for the magnet
         self.connection_label = QtWidgets.QLabel("Status: Disconnected")
         self.connection_label.setStyleSheet("font-size: 14px; color: red;")
         
-        # ===== Manual Control Group =====
+        # ===== Manual Control (high-precision slider + direct input) =====
         manual_group = QtWidgets.QGroupBox("Manual Control")
         manual_layout = QtWidgets.QGridLayout()
         
-        # Current Control - Slider Implementation
+        # Arrow buttons step the slider by the currently selected step size
         self.decrease_btn = QtWidgets.QPushButton("◀")
         self.decrease_btn.clicked.connect(self.decrease_slider)
         
+        # Slider emits valueChanged -> label color gradient, label text, and send_current_value()
         self.current_slider = ScrollableSlider(step_func=lambda: self.current_step)
         self.current_slider.setMinimum(0)
         self.current_slider.setMaximum(120 * self.multiplier)
@@ -232,18 +249,18 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.increase_btn = QtWidgets.QPushButton("▶")
         self.increase_btn.clicked.connect(self.increase_slider)
         
-        # Step size selector
+        # Step-size selector (A). We convert to ticks using self.multiplier.
         self.step_selector = QtWidgets.QComboBox()
         for step in self.allowed_steps:
             self.step_selector.addItem(f"{step:.3f}")
-        self.step_selector.setCurrentIndex(2)  # Default to 0.1
+        self.step_selector.setCurrentIndex(2)  # default 0.1 A
         self.step_selector.currentIndexChanged.connect(self.change_step_size)
         
-        # Current value display
+        # Live formatted readout matching slider position (not the power-supply readback)
         self.current_value_label = QtWidgets.QLabel("0.000 A")
         self.current_value_label.setStyleSheet("font-weight: bold;")
 
-        # NEW: Direct current input with send button
+        # Direct A input: sets the slider to the typed value (valueChanged triggers send)
         self.direct_current_input = QtWidgets.QDoubleSpinBox()
         self.direct_current_input.setRange(0, 120.0)
         self.direct_current_input.setDecimals(4)
@@ -253,7 +270,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.send_current_btn = QtWidgets.QPushButton("Send")
         self.send_current_btn.clicked.connect(self.send_direct_current)
         
-        # Voltage Limit
+        # Supply’s voltage limit (sent together with current)
         self.volt_spin = QtWidgets.QDoubleSpinBox()
         self.volt_spin.setRange(0, 100.0)
         self.volt_spin.setValue(60.0)
@@ -261,9 +278,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.volt_spin.setSuffix(" V")
         self.volt_spin.valueChanged.connect(self.send_current_value)
         
-        # (zweite Definition war doppelt; wir lassen eine)
-        
-        # Layout for manual control
+        # Layout
         manual_layout.addWidget(QtWidgets.QLabel("Target Current:"), 0, 0, 1, 2)
         manual_layout.addWidget(self.decrease_btn, 1, 0)
         manual_layout.addWidget(self.current_slider, 1, 1, 1, 3)
@@ -276,14 +291,13 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         manual_layout.addWidget(self.send_current_btn, 3, 2)
         manual_layout.addWidget(QtWidgets.QLabel("Voltage Limit:"), 4, 0)
         manual_layout.addWidget(self.volt_spin, 4, 1)
-        
         manual_group.setLayout(manual_layout)
         
-        # ===== Automatic Switching Group =====
+        # ===== Automatic Switching (rotate between currents based on new data files) =====
         auto_group = QtWidgets.QGroupBox("Current Switching")
         auto_layout = QtWidgets.QGridLayout()
         
-        # Current 1
+        # Currents 1..3 (A) and required file counts to stay at each current
         self.current1_spin = QtWidgets.QDoubleSpinBox()
         self.current1_spin.setRange(0, 120.0)
         self.current1_spin.setDecimals(4)
@@ -293,7 +307,6 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.count1_spin.setRange(1, 10000)
         self.count1_spin.setSuffix(" data points")
         
-        # Current 2
         self.current2_spin = QtWidgets.QDoubleSpinBox()
         self.current2_spin.setRange(0, 120.0)
         self.current2_spin.setDecimals(4)
@@ -303,7 +316,6 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.count2_spin.setRange(1, 10000)
         self.count2_spin.setSuffix(" data points")
         
-        # Current 3 (optional)
         self.enable_current3 = QtWidgets.QCheckBox("Enable Current 3")
         self.enable_current3.stateChanged.connect(self.toggle_current3)
         
@@ -318,14 +330,14 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.count3_spin.setSuffix(" data points")
         self.count3_spin.setEnabled(False)
         
-        # Mode Control
+        # Mode toggle and inline status
         self.auto_btn = QtWidgets.QPushButton("Start Auto Switching")
         self.auto_btn.clicked.connect(self.toggle_auto_mode)
         
         self.status_label = QtWidgets.QLabel("Mode: Manual")
         self.data_counter_label = QtWidgets.QLabel("Data changes detected: 0")
         
-        # Path configuration
+        # File path that is monitored for *.blk additions
         self.path_label = QtWidgets.QLabel("Data Path:")
         self.path_edit = QtWidgets.QLineEdit(r"\\192.168.0.1\current analysis\*.blk")
         self.path_edit.textChanged.connect(self.update_data_path)
@@ -353,11 +365,10 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         auto_layout.addWidget(self.data_counter_label, 4, 3, 1, 1)
         auto_group.setLayout(auto_layout)
         
-        # ===== Mass Scan Group =====
+        # ===== Mass Scan (linear sweep start->stop, increment per second) =====
         scan_group = QtWidgets.QGroupBox("Mass Scan")
         scan_layout = QtWidgets.QGridLayout()
         
-        # Scan Parameters
         self.scan_start_input = QtWidgets.QDoubleSpinBox()
         self.scan_start_input.setRange(0, 120.0)
         self.scan_start_input.setDecimals(4)
@@ -376,18 +387,15 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.scan_increment_input.setSuffix(" A/s")
         self.scan_increment_input.setValue(0.1)
         
-        # Scan Controls
         self.scan_enable_check = QtWidgets.QCheckBox("Enable Mass Scan")
         self.scan_start_btn = QtWidgets.QPushButton("Start Scan")
         self.scan_start_btn.clicked.connect(self.toggle_scan)
         self.scan_status_label = QtWidgets.QLabel("Status: Ready")
         
-        # Progress Bar
         self.scan_progress = QtWidgets.QProgressBar()
         self.scan_progress.setRange(0, 100)
         self.scan_progress.setValue(0)
         
-        # Layout
         scan_layout.addWidget(QtWidgets.QLabel("Start Value:"), 0, 0)
         scan_layout.addWidget(self.scan_start_input, 0, 1)
         scan_layout.addWidget(QtWidgets.QLabel("Stop Value:"), 1, 0)
@@ -398,25 +406,24 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         scan_layout.addWidget(self.scan_start_btn, 3, 1)
         scan_layout.addWidget(self.scan_status_label, 4, 0, 1, 2)
         scan_layout.addWidget(self.scan_progress, 5, 0, 1, 2)
-        
         scan_group.setLayout(scan_layout)
         
-        # ===== Measurements Group =====
+        # ===== Measurements (live readbacks) =====
         meas_group = QtWidgets.QGroupBox("Measurements")
         meas_layout = QtWidgets.QFormLayout()
         
         self.meas_current = QtWidgets.QLabel("--- A")
         self.meas_voltage = QtWidgets.QLabel("--- V")
-        self.meas_field   = QtWidgets.QLabel("--- kG")   # <<-- NEU: Feldanzeige
+        self.meas_field   = QtWidgets.QLabel("--- kG")   # Gaussmeter
         self.current_state_label = QtWidgets.QLabel("Current State: ---")
         
         meas_layout.addRow("Current:", self.meas_current)
         meas_layout.addRow("Voltage:", self.meas_voltage)
-        meas_layout.addRow("Magnetic Field:", self.meas_field)  # <<-- NEU
+        meas_layout.addRow("Magnetic Field:", self.meas_field)
         meas_layout.addRow("State:", self.current_state_label)
         meas_group.setLayout(meas_layout)
         
-        # ===== Logging Controls =====
+        # ===== Logging (CSV append) =====
         log_group = QtWidgets.QGroupBox("Data Logging")
         log_layout = QtWidgets.QHBoxLayout()
         
@@ -430,7 +437,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         log_layout.addWidget(self.log_file_label)
         log_group.setLayout(log_layout)
         
-        # ===== Assemble Main UI =====
+        # ===== Assemble top-level layout =====
         layout.addWidget(calc_group)
         layout.addWidget(self.connection_label)
         layout.addWidget(manual_group)
@@ -442,23 +449,23 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         widget.setLayout(layout)
         self.setCentralWidget(widget)
         
-        # Timers
+        # Timers: measurement loop (1 Hz), auto-switch check (5 s), scan loop (1 Hz)
         self.measurement_timer = QtCore.QTimer()
         self.measurement_timer.timeout.connect(self.update_measurements)
-        self.measurement_timer.start(1000)  # 1 second refresh
+        self.measurement_timer.start(1000)
         
         self.switch_timer = QtCore.QTimer()
         self.switch_timer.timeout.connect(self.check_data_count)
-        self.switch_timer.setInterval(5000)  # Check every 5 seconds
+        self.switch_timer.setInterval(5000)
         
         self.scan_timer = QtCore.QTimer()
         self.scan_timer.timeout.connect(self.update_scan)
-        self.scan_timer.setInterval(1000)  # 1 second interval for scan updates
+        self.scan_timer.setInterval(1000)
         
-        # Initialize slider color
+        # Initial slider styling
         self.update_slider_color(0)
 
-    # NEW: Method to handle direct current input
+    # --- Manual: direct current input (sets the slider; slider handles sending) ---
     def send_direct_current(self):
         """Set the current to the value specified in the direct input field"""
         current = self.direct_current_input.value()
@@ -470,10 +477,10 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Invalid Value", 
                                         "Current must be between 0 and 120 A")
 
-    # ===== Mass Scan Methods =====
+    # ---------------- Mass Scan (independent periodic sweep) ----------------
     def toggle_scan(self):
+        # Start/stop a linear sweep. Uses its own timer and writes setpoints each tick.
         if not self.scan_active:
-            # Start scan
             if not self.scan_enable_check.isChecked():
                 QtWidgets.QMessageBox.warning(self, "Warning", "Please enable mass scan first")
                 return
@@ -510,13 +517,12 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
             self.scan_progress.setValue(0)
     
     def update_scan(self):
+        # Advance one step; clamp at stop; update setpoint and progress bar.
         if not self.scan_active:
             return
         
-        # Update current
         self.scan_current += self.scan_increment
         
-        # Check if we've reached the target
         if (self.scan_increment > 0 and self.scan_current >= self.scan_stop) or \
            (self.scan_increment < 0 and self.scan_current <= self.scan_stop):
             self.scan_current = self.scan_stop
@@ -525,10 +531,8 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
             self.scan_start_btn.setText("Start Scan")
             self.scan_status_label.setText("Status: Complete")
         
-        # Set the new current
         self.set_scan_current()
         
-        # Update progress
         progress = int(100 * (self.scan_current - self.scan_start) / (self.scan_stop - self.scan_start))
         self.scan_progress.setValue(progress)
     
@@ -538,14 +542,14 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
             current = self.scan_current
             voltage = self.volt_spin.value()
             
-            # Update slider to reflect current value
+            # Mirror to the slider (valueChanged will also trigger color/label/send)
             self.current_slider.setValue(int(round(current * self.multiplier)))
             
-            # Send commands to device
+            # Push to supply
             self.send_command(f"sour:curr {current:.4f}")
             self.send_command(f"sour:volt {voltage:.3f}")
     
-    # ===== Calculation Methods =====
+    # ---------------- Calculation helpers ----------------
     def set_calculated_current(self):
         """Set the slider to the calculated current value"""
         try:
@@ -555,25 +559,30 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         except Exception as e:
             print(f"Error setting calculated current: {e}")
 
-    # ===== Slider Control Methods =====
+    # ---------------- Slider utilities ----------------
     def update_slider_label(self, value):
+        # Format slider ticks -> A for the inline label
         real_value = value / self.multiplier
         formatted = f"{real_value:.3f} A"
         self.current_value_label.setText(formatted)
         
     def change_step_size(self, index):
+        # Update internal tick step when user changes the step selector
         step_value = self.allowed_steps[index]
         self.current_step = int(step_value * self.multiplier)
         
     def decrease_slider(self):
+        # Nudge left by one configured step
         new_value = max(self.current_slider.minimum(), self.current_slider.value() - self.current_step)
         self.current_slider.setValue(new_value)
         
     def increase_slider(self):
+        # Nudge right by one configured step
         new_value = min(self.current_slider.maximum(), self.current_slider.value() + self.current_step)
         self.current_slider.setValue(new_value)
             
     def update_slider_color(self, value):
+        # Color-fill the slider track (green -> red) relative to 0..120 A for quick glanceability
         hue = 120 - int((value / (120 * self.multiplier)) * 120)
         color = f"hsl({hue}, 100%, 50%)"
 
@@ -603,13 +612,14 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
     
     def send_current_value(self):
         """Automatically send current value when slider changes"""
+        # Manual mode only; avoid fighting with the scan loop.
         if self.current_mode == "Manual" and self.sock and not self.scan_active:
             current = self.current_slider.value() / self.multiplier
             voltage = self.volt_spin.value()
             self.send_command(f"sour:curr {current:.4f}")
             self.send_command(f"sour:volt {voltage:.3f}")
     
-    # ===== Rest of the methods remain unchanged =====
+    # ---------------- Auto mode (rotate currents on new data files) ----------------
     def toggle_current3(self, state):
         """Enable/disable current 3 controls"""
         self.current3_spin.setEnabled(state == Qt.Checked)
@@ -620,6 +630,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.data_path = self.path_edit.text()
     
     def connect_device(self):
+        # Establish TCP to the magnet; show banner; initialize to 0 A / 0 V.
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(2.0)
@@ -635,6 +646,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
     
     def send_command(self, cmd):
         """Send command with line feed (\\n) and return response"""
+        # Thin SCPI-style wrapper. Only returns data for queries (ending with '?').
         try:
             self.sock.sendall((cmd + "\n").encode('ascii'))
             if cmd.endswith("?"):
@@ -645,25 +657,21 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
             return None
     
     def toggle_auto_mode(self):
+        # Switch between Manual and Auto. In Auto, rotate through configured currents
+        # when new *.blk files appear at the monitored path.
         if self.current_mode == "Manual":
-            # Start auto mode
             self.current_mode = "Auto"
             
-            # Get current values
             self.current_values = [
                 self.current1_spin.value(),
                 self.current2_spin.value(),
                 self.current3_spin.value() if self.enable_current3.isChecked() else None
             ]
-            
-            # Get data counts
             self.data_counts = [
                 self.count1_spin.value(),
                 self.count2_spin.value(),
                 self.count3_spin.value() if self.enable_current3.isChecked() else None
             ]
-            
-            # Remove None values if current3 is disabled
             if not self.enable_current3.isChecked():
                 self.current_values = self.current_values[:2]
                 self.data_counts = self.data_counts[:2]
@@ -673,22 +681,20 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
             self.data_counter = 0
             self.last_data_count = self.get_data_count()
             
-            # Apply first current
             self.apply_auto_current()
             
             self.auto_btn.setText("Stop Auto Switching")
             self.status_label.setText(f"Mode: Auto (Current {self.active_current_index + 1})")
             self.current_state_label.setText(f"Current State: {self.active_current_index + 1}")
-            self.switch_timer.start()  # Start checking data count
+            self.switch_timer.start()
         else:
-            # Stop auto mode
+            # Stop auto mode and return to Manual with outputs zeroed.
             self.current_mode = "Manual"
             self.switch_timer.stop()
             self.auto_btn.setText("Start Auto Switching")
             self.status_label.setText("Mode: Manual")
             self.current_state_label.setText("Current State: ---")
             
-            # Zero out
             self.send_command("sour:volt 0")
             self.send_command("sour:curr 0")
     
@@ -705,13 +711,11 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         """Check if data count has changed enough to switch currents"""
         current_count = self.get_data_count()
         if current_count > self.last_data_count:
-            # Data count has increased
             change = current_count - self.last_data_count
             self.data_counter += change
             self.last_data_count = current_count
             self.data_counter_label.setText(f"Data changes: {self.data_counter}")
             
-            # Check if we've reached the required count
             required_count = self.data_counts[self.active_current_index]
             if self.data_counter >= required_count:
                 self.data_counter = 0
@@ -719,7 +723,6 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
     
     def next_current(self):
         """Switch to the next current in sequence"""
-        # Determine next index
         if self.enable_current3.isChecked():
             self.active_current_index = (self.active_current_index + 1) % 3
         else:
@@ -740,31 +743,33 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         self.last_switch_time = datetime.now()
         self.data_counter_label.setText(f"Data changes: {self.data_counter}")
 
+    # ---------------- Beam calculations (simple model) ----------------
     def update_calculations(self):
         """Calculate magnetic field and required current"""
         try:
-            # Get inputs
+            # Inputs
             mass_u = self.mass_input.value()
             extraction_v = self.extraction_input.value()
             sputter_v = self.sputter_input.value()
             
-            # Convert to SI units
-            mass_kg = mass_u * 1.66054e-27  # kg
-            total_energy_ev = extraction_v + sputter_v  # eV
+            # SI conversions
+            mass_kg = mass_u * 1.66054e-27             # kg
+            total_energy_ev = extraction_v + sputter_v  # eV (simple sum)
             
-            # Corrected magnetic field calculation
-            b_field_tesla = np.sqrt(2 * total_energy_ev * 1.60218e-19 * mass_kg) / (1.60218e-19 * 0.5)  
-            b_field_kilogauss = b_field_tesla * 10  # 1 T = 10 kG
+            # B-field estimate (domain-specific model)
+            b_field_tesla = np.sqrt(2 * total_energy_ev * 1.60218e-19 * mass_kg) / (1.60218e-19 * 0.5)
+            b_field_kilogauss = b_field_tesla * 10     # 1 T = 10 kG
             
-            # Current calculation (your formula)
+            # Current from B (linear fit parameters as provided)
             current = (b_field_kilogauss - 0.0937) / 0.1055
             
-            # Update displays
+            # Update UI
             self.b_field_indicator.setText(f"{b_field_kilogauss:.2f} kG")
             self.calc_current_indicator.setText(f"{current:.4f} A")
         except Exception as e:
             print(f"Calculation error: {e}")
 
+    # ---------------- Live measurements & logging ----------------
     def update_measurements(self):
         """Jede Sekunde: Strom/Spannung vom Netzteil + Feld (kG) vom Gaussmeter lesen, anzeigen & ggf. loggen."""
         # --- Magnet: Current & Voltage ---
@@ -792,8 +797,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         else:
             self.meas_voltage.setText("--- V")
 
-        # --- Gaussmeter: Field (kG) ---
-        # Reconnect versuchen, falls keine Verbindung besteht
+        # --- Gaussmeter: Field (kG) with lazy reconnect on failure ---
         if self.gm_sock is None:
             self.connect_gaussmeter()
 
@@ -801,7 +805,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
         if self.gm_sock:
             try:
                 field_kG = self._gm_read_field_kG()
-                if field_kG != field_kG:  # NaN => Fehler, reconnect nächster Tick
+                if field_kG != field_kG:  # NaN -> treat as failure; drop socket
                     try:
                         self.gm_sock.close()
                     except:
@@ -819,13 +823,11 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
                 self.gm_sock = None
                 self.meas_field.setText("--- kG")
         else:
-            # keine Verbindung
             self.meas_field.setText("--- kG")
 
-        # --- Logging (wenn aktiv) ---
+        # --- Logging (CSV; use last valid values) ---
         if self.logging_active and self.log_file:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            # nutze die zuletzt gültigen Werte; bei None/NaN schreibe leer
             curr_str = f"{current_val:.6f}" if isinstance(current_val, float) else ""
             volt_str = f"{voltage_val:.6f}" if isinstance(voltage_val, float) else ""
             field_str = f"{self.last_field_kG:.6f}" if self.last_field_kG == self.last_field_kG else ""
@@ -833,21 +835,18 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
             self.log_file.flush()
 
     def toggle_logging(self):
+        # Start/stop CSV logging; append mode; write header if file was empty.
         if not self.logging_active:
-            # Start logging - prompt for file location
             options = QtWidgets.QFileDialog.Options()
             file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self, "Select Log File", "", "Text Files (*.txt);;All Files (*)", options=options)
             
             if file_path:
                 try:
-                    # Open the file in append mode
                     self.log_file = open(file_path, 'a')
                     self.log_start_time = datetime.now()
                     
-                    # Write header if file is empty
                     if os.stat(file_path).st_size == 0:
-                        # Jetzt mit Spannung und Feld in kG
                         self.log_file.write("Timestamp,Current(A),Voltage(V),Field(kG)\n")
                     
                     self.logging_active = True
@@ -857,7 +856,6 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
                 except Exception as e:
                     QtWidgets.QMessageBox.warning(self, "Error", f"Could not open log file: {str(e)}")
         else:
-            # Stop logging
             self.logging_active = False
             if self.log_file:
                 self.log_file.close()
@@ -867,19 +865,20 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
             self.log_status.setText("Logging: Inactive")
             self.log_file_label.setText("No file selected")
     
+    # ---------------- Window lifecycle ----------------
     def closeEvent(self, event):
         """Cleanup on exit with user confirmation"""
-        # Stop any active processes first
+        # Stop active processes first (so background timers don't race during shutdown).
         if self.current_mode == "Auto":
-            self.toggle_auto_mode()  # Stop auto mode first
+            self.toggle_auto_mode()
         
         if self.logging_active:
-            self.toggle_logging()  # Stop logging
+            self.toggle_logging()
         
         if self.scan_active:
-            self.toggle_scan()  # Stop scan
+            self.toggle_scan()
     
-        # Ask user for confirmation
+        # Ask whether to zero the magnet on exit.
         reply = QtWidgets.QMessageBox.question(
             self, 'Confirm Exit',
             "Do you want to shut down the magnet (go to 0A)?\n"
@@ -890,13 +889,13 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
     
         if self.sock:
             if reply == QtWidgets.QMessageBox.Yes:
-                # Shut down magnet
+                # Safe shutdown
                 self.send_command("sour:volt 0")
                 self.send_command("sour:curr 0")
             else:
-                # Keep current values - use proper string formatting
-                self.send_command(r"sour:volt\s0\nsour:curr\s0\n")  # Using raw string
-        
+                # Keep current values (string as-is per original code)
+                self.send_command(r"sour:volt\s0\nsour:curr\s0\n")
+            
             # Close the socket connection
             self.sock.close()
 
@@ -907,6 +906,7 @@ class DeltaMagnetController(QtWidgets.QMainWindow):
                 pass
     
         event.accept()
+
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
